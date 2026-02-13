@@ -216,6 +216,33 @@ ensure_relay_lan_ip() {
   fi
 }
 
+prompt_relay_lan_ip_on_start() {
+  local input
+
+  while true; do
+    if valid_ipv4 "$RELAY_LAN_IP"; then
+      read -r -p "Relay LAN IP (SNAT source IP) [current: $RELAY_LAN_IP, Enter to keep]: " input
+      if [[ -z "$input" ]]; then
+        echo "Relay LAN IP kept: $RELAY_LAN_IP"
+        return 0
+      fi
+    else
+      read -r -p "Relay LAN IP (SNAT source IP): " input
+      if [[ -z "$input" ]]; then
+        echo "Relay LAN IP cannot be empty."
+        continue
+      fi
+    fi
+
+    if valid_ipv4 "$input"; then
+      RELAY_LAN_IP="$input"
+      echo "Relay LAN IP set to $RELAY_LAN_IP"
+      return 0
+    fi
+    echo "Invalid Relay LAN IP."
+  done
+}
+
 ensure_tcp_mss() {
   if valid_mss "$TCP_MSS"; then
     return 0
@@ -571,6 +598,7 @@ EOF
 main() {
   require_root
   load_state
+  prompt_relay_lan_ip_on_start
 
   while true; do
     show_menu

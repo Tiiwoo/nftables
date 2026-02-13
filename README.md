@@ -28,6 +28,7 @@
 
 - `DNAT`：同上
 - `SNAT`：固定 `snat to $RELAY_LAN_IP`
+- 启动时会先询问 `RELAY_LAN_IP`（已有值可回车保持）
 - 额外支持 `TCP MSS`（默认 `1452`，可在菜单里改，`0` 表示关闭）
 - 适合你 PO0/专线固定内网源 IP 场景
 
@@ -79,4 +80,3 @@ sudo cp /etc/nftables.conf /etc/nftables.conf.bak.$(date +%F-%H%M%S)
 NFTMGR_TEST_MODE=1 NFTMGR_SKIP_ROOT_CHECK=1 NFT_CONF=/tmp/nft-test.conf ./nft.sh
 NFTMGR_TEST_MODE=1 NFTMGR_SKIP_ROOT_CHECK=1 NFT_CONF=/tmp/nft-po0-test.conf ./nft-po0.sh
 ```
-
