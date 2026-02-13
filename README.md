@@ -15,6 +15,7 @@
 - 修改后自动生效
 - 支持 `systemctl enable --now nftables`
 - 规则统一写入并管理 `/etc/nftables.conf`（覆盖式）
+- Docker-safe：不使用 `flush ruleset`，仅管理脚本自己的独立 table
 
 ## 两个脚本的区别
 
@@ -22,6 +23,7 @@
 
 - `DNAT`：把本机端口转发到对端
 - `SNAT`：`masquerade`
+- 使用独立 table：`nft_mgr_nat`
 - 适合普通公网出口场景
 
 ### `nft-po0.sh`（专线）
@@ -30,6 +32,7 @@
 - `SNAT`：固定 `snat to $RELAY_LAN_IP`
 - 启动时会先询问 `RELAY_LAN_IP`（已有值可回车保持）
 - 额外支持 `TCP MSS`（默认 `1452`，可在菜单里改，`0` 表示关闭）
+- 使用独立 table：`nft_po0_nat` / `nft_po0_filter`
 - 适合你 PO0/专线固定内网源 IP 场景
 
 ## 在 VPS 上直接下载（curl）

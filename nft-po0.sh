@@ -7,6 +7,8 @@ SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/99-nft-po0-forward.conf}"
 MANAGED_BEGIN="# === nft-po0.sh managed records begin ==="
 MANAGED_END="# === nft-po0.sh managed records end ==="
 DEFAULT_MSS="${DEFAULT_MSS:-1452}"
+NAT_TABLE="nft_po0_nat"
+FILTER_TABLE="nft_po0_filter"
 
 NFTMGR_TEST_MODE="${NFTMGR_TEST_MODE:-0}"
 NFTMGR_SKIP_ROOT_CHECK="${NFTMGR_SKIP_ROOT_CHECK:-0}"
@@ -151,6 +153,40 @@ ensure_ipv4_forwarding() {
 
   echo "Forwarding not enabled. Port forwarding may not work."
   return 1
+}
+
+table_exists() {
+  local table="$1"
+  nft list table ip "$table" >/dev/null 2>&1
+}
+
+delete_table_if_exists() {
+  local table="$1"
+  if table_exists "$table"; then
+    nft delete table ip "$table"
+  fi
+}
+
+syntax_check_rules_file() {
+  local input_file="$1"
+  local check_file check_nat check_filter
+
+  check_file="$(mktemp)"
+  check_nat="${NAT_TABLE}_check_${RANDOM}_$$"
+  check_filter="${FILTER_TABLE}_check_${RANDOM}_$$"
+
+  sed \
+    -e "s/table ip ${NAT_TABLE}/table ip ${check_nat}/g" \
+    -e "s/table ip ${FILTER_TABLE}/table ip ${check_filter}/g" \
+    "$input_file" > "$check_file"
+
+  if ! nft -c -f "$check_file"; then
+    rm -f "$check_file"
+    return 1
+  fi
+
+  rm -f "$check_file"
+  return 0
 }
 
 load_records() {
@@ -357,9 +393,8 @@ render_config() {
 
   {
     echo "#!/usr/sbin/nft -f"
-    echo "flush ruleset"
     echo
-    echo "# Managed by nft-po0.sh (fixed SNAT source IP)"
+    echo "# Managed by nft-po0.sh (fixed SNAT source IP, docker-safe no flush)"
     echo "define RELAY_LAN_IP = $RELAY_LAN_IP"
     echo "define TCP_MSS = $TCP_MSS"
     echo
@@ -369,7 +404,7 @@ render_config() {
     done
     echo "$MANAGED_END"
     echo
-    echo "table ip nat {"
+    echo "table ip $NAT_TABLE {"
     echo "    chain prerouting {"
     echo "        type nat hook prerouting priority dstnat; policy accept;"
     for rec in "${RECORDS[@]}"; do
@@ -389,7 +424,7 @@ render_config() {
     echo "    }"
     echo "}"
     echo
-    echo "table ip filter {"
+    echo "table ip $FILTER_TABLE {"
     echo "    chain forward {"
     echo "        type filter hook forward priority 0; policy accept;"
     if [[ -n "$dest_set" ]] && ((TCP_MSS > 0)); then
@@ -426,11 +461,14 @@ apply_rules() {
     return 0
   fi
 
-  if ! nft -c -f "$tmp_file"; then
+  if ! syntax_check_rules_file "$tmp_file"; then
     rm -f "$tmp_file"
     echo "nft config check failed. Existing config not changed."
     return 1
   fi
+
+  delete_table_if_exists "$NAT_TABLE"
+  delete_table_if_exists "$FILTER_TABLE"
 
   if ! nft -f "$tmp_file"; then
     rm -f "$tmp_file"

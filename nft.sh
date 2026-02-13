@@ -6,6 +6,7 @@ NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
 SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/99-nft-generic-forward.conf}"
 MANAGED_BEGIN="# === nft.sh managed records begin ==="
 MANAGED_END="# === nft.sh managed records end ==="
+NAT_TABLE="nft_mgr_nat"
 
 NFTMGR_TEST_MODE="${NFTMGR_TEST_MODE:-0}"
 NFTMGR_SKIP_ROOT_CHECK="${NFTMGR_SKIP_ROOT_CHECK:-0}"
@@ -144,6 +145,35 @@ ensure_ipv4_forwarding() {
   return 1
 }
 
+table_exists() {
+  local table="$1"
+  nft list table ip "$table" >/dev/null 2>&1
+}
+
+delete_table_if_exists() {
+  local table="$1"
+  if table_exists "$table"; then
+    nft delete table ip "$table"
+  fi
+}
+
+syntax_check_rules_file() {
+  local input_file="$1"
+  local check_file check_nat
+
+  check_file="$(mktemp)"
+  check_nat="${NAT_TABLE}_check_${RANDOM}_$$"
+
+  sed -e "s/table ip ${NAT_TABLE}/table ip ${check_nat}/g" "$input_file" > "$check_file"
+  if ! nft -c -f "$check_file"; then
+    rm -f "$check_file"
+    return 1
+  fi
+
+  rm -f "$check_file"
+  return 0
+}
+
 load_records() {
   local line parsed
   RECORDS=()
@@ -209,16 +239,15 @@ render_config() {
 
   {
     echo "#!/usr/sbin/nft -f"
-    echo "flush ruleset"
     echo
-    echo "# Managed by nft.sh (generic forward)"
+    echo "# Managed by nft.sh (generic forward, docker-safe no flush)"
     echo "$MANAGED_BEGIN"
     for rec in "${RECORDS[@]}"; do
       echo "# RULE $rec"
     done
     echo "$MANAGED_END"
     echo
-    echo "table ip nat {"
+    echo "table ip $NAT_TABLE {"
     echo "    chain prerouting {"
     echo "        type nat hook prerouting priority dstnat; policy accept;"
     for rec in "${RECORDS[@]}"; do
@@ -261,11 +290,13 @@ apply_rules() {
     return 0
   fi
 
-  if ! nft -c -f "$tmp_file"; then
+  if ! syntax_check_rules_file "$tmp_file"; then
     rm -f "$tmp_file"
     echo "nft config check failed. Existing config not changed."
     return 1
   fi
+
+  delete_table_if_exists "$NAT_TABLE"
 
   if ! nft -f "$tmp_file"; then
     rm -f "$tmp_file"
