@@ -18,6 +18,8 @@ declare -a RECORDS=()
 RELAY_LAN_IP=""
 TCP_MSS="$DEFAULT_MSS"
 
+# --- Utility functions ---
+
 to_lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
@@ -41,12 +43,22 @@ require_root() {
 
 confirm() {
   local prompt="$1"
-  local answer
-  local answer_lower
+  local answer answer_lower
   read -r -p "$prompt" answer
   answer_lower="$(to_lower "$answer")"
   case "$answer_lower" in
     y|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+confirm_default_yes() {
+  local prompt="$1"
+  local answer answer_lower
+  read -r -p "$prompt" answer
+  answer_lower="$(to_lower "$answer")"
+  case "$answer_lower" in
+    ""|y|yes) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -77,6 +89,64 @@ valid_mss() {
   ((mss == 0 || (mss >= 536 && mss <= 9000)))
 }
 
+format_rule() {
+  local proto="$1" local_port="$2" remote_ip="$3" remote_port="$4"
+  printf "%s/%s -> %s:%s" "$local_port" "$proto" "$remote_ip" "$remote_port"
+}
+
+read_protocols() {
+  local input="$1"
+  local input_lower
+  input_lower="$(to_lower "$input")"
+  case "$input_lower" in
+    ""|both|b) echo "tcp udp" ;;
+    tcp|t) echo "tcp" ;;
+    udp|u) echo "udp" ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_quick_input() {
+  local input="$1"
+  local -a parts
+  local local_port proto_str remote_part remote_ip remote_port
+
+  IFS=' ' read -r -a parts <<< "$input"
+
+  case "${#parts[@]}" in
+    2)
+      local_port="${parts[0]}"
+      proto_str="both"
+      remote_part="${parts[1]}"
+      ;;
+    3)
+      local_port="${parts[0]}"
+      proto_str="${parts[1]}"
+      remote_part="${parts[2]}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  if [[ "$remote_part" == *:* ]]; then
+    remote_ip="${remote_part%:*}"
+    remote_port="${remote_part##*:}"
+  else
+    remote_ip="$remote_part"
+    remote_port="$local_port"
+  fi
+
+  valid_port "$local_port" || return 1
+  read_protocols "$proto_str" >/dev/null 2>&1 || return 1
+  valid_ipv4 "$remote_ip" || return 1
+  valid_port "$remote_port" || return 1
+
+  echo "$local_port $proto_str $remote_ip $remote_port"
+}
+
+# --- Parse / Load ---
+
 parse_rule_line() {
   local line="$1"
   local hash tag proto local_port remote_ip remote_port extra
@@ -91,6 +161,105 @@ parse_rule_line() {
 
   echo "$proto $local_port $remote_ip $remote_port"
 }
+
+load_records() {
+  local line parsed
+  RECORDS=()
+  [[ -f "$NFT_CONF" ]] || return 0
+
+  while IFS= read -r line; do
+    parsed="$(parse_rule_line "$line" || true)"
+    [[ -n "$parsed" ]] && RECORDS+=("$parsed")
+  done < "$NFT_CONF"
+}
+
+load_relay_lan_ip() {
+  local line
+  local matched_ip
+  RELAY_LAN_IP=""
+  [[ -f "$NFT_CONF" ]] || return 0
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^define[[:space:]]+RELAY_LAN_IP[[:space:]]*=[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      matched_ip="${BASH_REMATCH[1]}"
+      if valid_ipv4 "$matched_ip"; then
+        RELAY_LAN_IP="$matched_ip"
+        return 0
+      fi
+    fi
+  done < "$NFT_CONF"
+}
+
+load_tcp_mss() {
+  local line
+  local matched_mss
+  TCP_MSS="$DEFAULT_MSS"
+  [[ -f "$NFT_CONF" ]] || return 0
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^define[[:space:]]+TCP_MSS[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+      matched_mss="${BASH_REMATCH[1]}"
+      if valid_mss "$matched_mss"; then
+        TCP_MSS="$matched_mss"
+        return 0
+      fi
+    fi
+  done < "$NFT_CONF"
+}
+
+load_state() {
+  load_records
+  load_relay_lan_ip
+  load_tcp_mss
+}
+
+# --- RELAY_LAN_IP / TCP_MSS management ---
+
+ensure_relay_lan_ip() {
+  local input
+  if valid_ipv4 "$RELAY_LAN_IP"; then
+    return 0
+  fi
+
+  read -r -p "Relay LAN IP (SNAT source IP): " input
+  if ! valid_ipv4 "$input"; then
+    echo "Invalid Relay LAN IP."
+    return 1
+  fi
+  RELAY_LAN_IP="$input"
+}
+
+ensure_tcp_mss() {
+  if valid_mss "$TCP_MSS"; then
+    return 0
+  fi
+  TCP_MSS="$DEFAULT_MSS"
+  return 0
+}
+
+set_relay_lan_ip() {
+  local input
+  read -r -p "Relay LAN IP (current: ${RELAY_LAN_IP:-unset}): " input
+  if ! valid_ipv4 "$input"; then
+    echo "Invalid Relay LAN IP."
+    return 1
+  fi
+  RELAY_LAN_IP="$input"
+  echo "Relay LAN IP set to $RELAY_LAN_IP"
+}
+
+set_tcp_mss() {
+  local value
+  read -r -p "TCP MSS (0=disable, current: ${TCP_MSS}): " value
+  if ! valid_mss "$value"; then
+    echo "Invalid MSS. Use 0 or 536-9000."
+    return 1
+  fi
+  TCP_MSS="$value"
+  echo "TCP MSS set to $TCP_MSS"
+}
+
+# --- System checks ---
 
 ensure_nftables_installed() {
   if is_enabled "$NFTMGR_TEST_MODE"; then
@@ -155,6 +324,8 @@ ensure_ipv4_forwarding() {
   return 1
 }
 
+# --- nft operations ---
+
 table_exists() {
   local table="$1"
   nft list table ip "$table" >/dev/null 2>&1
@@ -189,123 +360,7 @@ syntax_check_rules_file() {
   return 0
 }
 
-load_records() {
-  local line parsed
-  RECORDS=()
-  [[ -f "$NFT_CONF" ]] || return 0
-
-  while IFS= read -r line; do
-    parsed="$(parse_rule_line "$line" || true)"
-    [[ -n "$parsed" ]] && RECORDS+=("$parsed")
-  done < "$NFT_CONF"
-}
-
-load_relay_lan_ip() {
-  local line
-  local matched_ip
-  RELAY_LAN_IP=""
-  [[ -f "$NFT_CONF" ]] || return 0
-
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^define[[:space:]]+RELAY_LAN_IP[[:space:]]*=[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-      matched_ip="${BASH_REMATCH[1]}"
-      if valid_ipv4 "$matched_ip"; then
-        RELAY_LAN_IP="$matched_ip"
-        return 0
-      fi
-    fi
-  done < "$NFT_CONF"
-}
-
-load_tcp_mss() {
-  local line
-  local matched_mss
-  TCP_MSS="$DEFAULT_MSS"
-  [[ -f "$NFT_CONF" ]] || return 0
-
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^define[[:space:]]+TCP_MSS[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
-      matched_mss="${BASH_REMATCH[1]}"
-      if valid_mss "$matched_mss"; then
-        TCP_MSS="$matched_mss"
-        return 0
-      fi
-    fi
-  done < "$NFT_CONF"
-}
-
-load_state() {
-  load_records
-  load_relay_lan_ip
-  load_tcp_mss
-}
-
-ensure_relay_lan_ip() {
-  if valid_ipv4 "$RELAY_LAN_IP"; then
-    return 0
-  fi
-
-  read -r -p "Relay LAN IP (SNAT source IP): " RELAY_LAN_IP
-  if ! valid_ipv4 "$RELAY_LAN_IP"; then
-    echo "Invalid Relay LAN IP."
-    return 1
-  fi
-}
-
-prompt_relay_lan_ip_on_start() {
-  local input
-
-  while true; do
-    if valid_ipv4 "$RELAY_LAN_IP"; then
-      read -r -p "Relay LAN IP (SNAT source IP) [current: $RELAY_LAN_IP, Enter to keep]: " input
-      if [[ -z "$input" ]]; then
-        echo "Relay LAN IP kept: $RELAY_LAN_IP"
-        return 0
-      fi
-    else
-      read -r -p "Relay LAN IP (SNAT source IP): " input
-      if [[ -z "$input" ]]; then
-        echo "Relay LAN IP cannot be empty."
-        continue
-      fi
-    fi
-
-    if valid_ipv4 "$input"; then
-      RELAY_LAN_IP="$input"
-      echo "Relay LAN IP set to $RELAY_LAN_IP"
-      return 0
-    fi
-    echo "Invalid Relay LAN IP."
-  done
-}
-
-ensure_tcp_mss() {
-  if valid_mss "$TCP_MSS"; then
-    return 0
-  fi
-  TCP_MSS="$DEFAULT_MSS"
-  return 0
-}
-
-set_relay_lan_ip() {
-  read -r -p "Relay LAN IP (current: ${RELAY_LAN_IP:-unset}): " RELAY_LAN_IP
-  if ! valid_ipv4 "$RELAY_LAN_IP"; then
-    echo "Invalid Relay LAN IP."
-    return 1
-  fi
-  echo "Relay LAN IP set to $RELAY_LAN_IP"
-}
-
-set_tcp_mss() {
-  local value
-  read -r -p "TCP MSS (0=disable, current: ${TCP_MSS}): " value
-  if ! valid_mss "$value"; then
-    echo "Invalid MSS. Use 0 or 536-9000."
-    return 1
-  fi
-  TCP_MSS="$value"
-  echo "TCP MSS set to $TCP_MSS"
-}
+# --- Rule checks ---
 
 rule_exists() {
   local proto="$1"
@@ -342,17 +397,7 @@ port_in_use() {
   esac
 }
 
-read_protocols() {
-  local input="$1"
-  local input_lower
-  input_lower="$(to_lower "$input")"
-  case "$input_lower" in
-    ""|both|b) echo "tcp udp" ;;
-    tcp|t) echo "tcp" ;;
-    udp|u) echo "udp" ;;
-    *) return 1 ;;
-  esac
-}
+# --- Render / Apply ---
 
 build_dest_ip_set() {
   local rec proto local_port remote_ip remote_port
@@ -387,7 +432,20 @@ build_dest_ip_set() {
 render_config() {
   local output_file="${1:-$NFT_CONF}"
   local rec proto local_port remote_ip remote_port
-  local dest_set
+  local key protos dest_set
+  local -A grouped_protos=()
+  local -a grouped_order=()
+
+  for rec in "${RECORDS[@]}"; do
+    read -r proto local_port remote_ip remote_port <<< "$rec"
+    key="${local_port}|${remote_ip}|${remote_port}"
+    if [[ -z "${grouped_protos[$key]:-}" ]]; then
+      grouped_protos[$key]="$proto"
+      grouped_order+=("$key")
+    elif [[ "${grouped_protos[$key]}" != *"$proto"* ]]; then
+      grouped_protos[$key]+=" $proto"
+    fi
+  done
 
   dest_set="$(build_dest_ip_set)"
 
@@ -407,19 +465,33 @@ render_config() {
     echo "table ip $NAT_TABLE {"
     echo "    chain prerouting {"
     echo "        type nat hook prerouting priority dstnat; policy accept;"
-    for rec in "${RECORDS[@]}"; do
-      read -r proto local_port remote_ip remote_port <<< "$rec"
-      printf "        meta l4proto %s %s dport %s dnat to %s:%s\n" \
-        "$proto" "$proto" "$local_port" "$remote_ip" "$remote_port"
+    for key in "${grouped_order[@]}"; do
+      IFS='|' read -r local_port remote_ip remote_port <<< "$key"
+      protos="${grouped_protos[$key]}"
+      case "$protos" in
+        "tcp udp"|"udp tcp")
+          printf "        meta l4proto { tcp, udp } th dport %s dnat to %s:%s\n" \
+            "$local_port" "$remote_ip" "$remote_port" ;;
+        *)
+          printf "        %s dport %s dnat to %s:%s\n" \
+            "$protos" "$local_port" "$remote_ip" "$remote_port" ;;
+      esac
     done
     echo "    }"
     echo
     echo "    chain postrouting {"
     echo "        type nat hook postrouting priority srcnat; policy accept;"
-    for rec in "${RECORDS[@]}"; do
-      read -r proto local_port remote_ip remote_port <<< "$rec"
-      printf "        ip daddr %s meta l4proto %s %s dport %s snat to \$RELAY_LAN_IP\n" \
-        "$remote_ip" "$proto" "$proto" "$remote_port"
+    for key in "${grouped_order[@]}"; do
+      IFS='|' read -r local_port remote_ip remote_port <<< "$key"
+      protos="${grouped_protos[$key]}"
+      case "$protos" in
+        "tcp udp"|"udp tcp")
+          printf "        ip daddr %s meta l4proto { tcp, udp } th dport %s snat to \$RELAY_LAN_IP\n" \
+            "$remote_ip" "$remote_port" ;;
+        *)
+          printf "        ip daddr %s %s dport %s snat to \$RELAY_LAN_IP\n" \
+            "$remote_ip" "$protos" "$remote_port" ;;
+      esac
     done
     echo "    }"
     echo "}"
@@ -486,6 +558,8 @@ apply_rules() {
   echo "Rules applied and persisted successfully."
 }
 
+# --- Core operations ---
+
 list_rules() {
   local i=0
   local rec proto local_port remote_ip remote_port
@@ -503,48 +577,21 @@ list_rules() {
   for rec in "${RECORDS[@]}"; do
     read -r proto local_port remote_ip remote_port <<< "$rec"
     i=$((i + 1))
-    printf "%d) %s/%s -> %s:%s\n" "$i" "$local_port" "$proto" "$remote_ip" "$remote_port"
+    printf "%d) %s\n" "$i" "$(format_rule "$proto" "$local_port" "$remote_ip" "$remote_port")"
   done
 }
 
-add_rule() {
-  local local_port remote_ip remote_port proto_input proto_values
+add_rule_impl() {
+  local local_port="$1" proto_input="$2" remote_ip="$3" remote_port="$4"
+  local skip_confirm="${5:-0}"
+  local proto_values p
   local -a protocols
-  local p
 
-  if ! ensure_ss_available; then
-    return 1
-  fi
-
-  if ! ensure_relay_lan_ip; then
-    return 1
-  fi
-  ensure_tcp_mss
-
-  read -r -p "Local port: " local_port
-  if ! valid_port "$local_port"; then
-    echo "Invalid local port."
-    return 1
-  fi
-
-  read -r -p "Protocol [tcp/udp/both] (default: both): " proto_input
   if ! proto_values="$(read_protocols "$proto_input")"; then
     echo "Invalid protocol selection."
     return 1
   fi
   IFS=' ' read -r -a protocols <<< "$proto_values"
-
-  read -r -p "Remote IP (IPv4): " remote_ip
-  if ! valid_ipv4 "$remote_ip"; then
-    echo "Invalid IPv4 address."
-    return 1
-  fi
-
-  read -r -p "Remote port: " remote_port
-  if ! valid_port "$remote_port"; then
-    echo "Invalid remote port."
-    return 1
-  fi
 
   for p in "${protocols[@]}"; do
     if rule_exists "$p" "$local_port"; then
@@ -557,26 +604,76 @@ add_rule() {
     fi
   done
 
+  echo "Add rule: $local_port/$proto_input -> $remote_ip:$remote_port"
+  if ((skip_confirm == 0)); then
+    if ! confirm_default_yes "Confirm? [Y/n]: "; then
+      echo "Cancelled."
+      return 1
+    fi
+  fi
+
   for p in "${protocols[@]}"; do
     RECORDS+=("$p $local_port $remote_ip $remote_port")
   done
 
-  echo "Rule added."
   ensure_ipv4_forwarding || true
   apply_rules
 }
 
-delete_rule() {
-  local id i
-  local -a next_records=()
+add_rule() {
+  local local_port remote_ip remote_port proto_input quick_input parsed
 
-  if [[ "${#RECORDS[@]}" -eq 0 ]]; then
-    echo "No rules to delete."
+  if ! ensure_ss_available; then
     return 1
   fi
 
-  list_rules || true
-  read -r -p "Enter rule number to delete: " id
+  if ! ensure_relay_lan_ip; then
+    return 1
+  fi
+  ensure_tcp_mss
+
+  echo "Quick add format: PORT [PROTO] IP[:RPORT] (e.g. 10086 172.81.1.1:33333)"
+  read -r -p "Quick add (or Enter for step-by-step): " quick_input
+
+  if [[ -n "$quick_input" ]]; then
+    if ! parsed="$(parse_quick_input "$quick_input")"; then
+      echo "Invalid format. Example: 10086 172.81.1.1:33333"
+      return 1
+    fi
+    read -r local_port proto_input remote_ip remote_port <<< "$parsed"
+  else
+    read -r -p "Local port: " local_port
+    if ! valid_port "$local_port"; then
+      echo "Invalid local port."
+      return 1
+    fi
+
+    read -r -p "Protocol [tcp/udp/both] (default: both): " proto_input
+    proto_input="${proto_input:-both}"
+
+    read -r -p "Remote IP (IPv4): " remote_ip
+    if ! valid_ipv4 "$remote_ip"; then
+      echo "Invalid IPv4 address."
+      return 1
+    fi
+
+    read -r -p "Remote port (default: $local_port): " remote_port
+    remote_port="${remote_port:-$local_port}"
+    if ! valid_port "$remote_port"; then
+      echo "Invalid remote port."
+      return 1
+    fi
+  fi
+
+  add_rule_impl "$local_port" "$proto_input" "$remote_ip" "$remote_port"
+}
+
+delete_rule_impl() {
+  local id="$1"
+  local skip_confirm="${2:-0}"
+  local i
+  local -a next_records=()
+  local del_rec del_proto del_lport del_rip del_rport
 
   if ! [[ "$id" =~ ^[0-9]+$ ]]; then
     echo "Invalid selection."
@@ -587,6 +684,17 @@ delete_rule() {
     return 1
   fi
 
+  del_rec="${RECORDS[$((id - 1))]}"
+  read -r del_proto del_lport del_rip del_rport <<< "$del_rec"
+  echo "Delete rule: $(format_rule "$del_proto" "$del_lport" "$del_rip" "$del_rport")"
+
+  if ((skip_confirm == 0)); then
+    if ! confirm "Confirm delete? [y/N]: "; then
+      echo "Cancelled."
+      return 1
+    fi
+  fi
+
   for i in "${!RECORDS[@]}"; do
     if (( i != id - 1 )); then
       next_records+=("${RECORDS[$i]}")
@@ -594,8 +702,20 @@ delete_rule() {
   done
   RECORDS=("${next_records[@]}")
 
-  echo "Rule deleted."
   apply_rules
+}
+
+delete_rule() {
+  local id
+
+  if [[ "${#RECORDS[@]}" -eq 0 ]]; then
+    echo "No rules to delete."
+    return 1
+  fi
+
+  list_rules || true
+  read -r -p "Enter rule number to delete: " id
+  delete_rule_impl "$id"
 }
 
 enable_nftables_service() {
@@ -615,6 +735,139 @@ enable_nftables_service() {
   echo "nftables service enabled and started."
 }
 
+# --- CLI support ---
+
+show_usage() {
+  cat <<EOF
+Usage:
+  $0                              Interactive menu
+  $0 list                         List current rules
+  $0 add PORT [PROTO] IP[:RPORT]  Add a forwarding rule
+  $0 del NUMBER [-y]              Delete a rule by number
+  $0 apply                        Re-apply rules from config
+  $0 set-ip IP                    Set RELAY_LAN_IP
+  $0 set-mss MSS                  Set TCP MSS (0=disable)
+  $0 help                         Show this help
+
+Examples:
+  $0 set-ip 10.100.1.1
+  $0 add 10086 172.81.1.1:33333       # both tcp+udp
+  $0 add 10086 tcp 172.81.1.1:33333   # tcp only
+  $0 add 10086 172.81.1.1             # remote port = local port
+  $0 del 1 -y                         # delete rule #1, skip confirmation
+EOF
+}
+
+require_relay_lan_ip_cli() {
+  if valid_ipv4 "$RELAY_LAN_IP"; then
+    return 0
+  fi
+  echo "RELAY_LAN_IP not set. Run first: $0 set-ip IP"
+  return 1
+}
+
+cli_add_rule() {
+  local skip_confirm=0
+  local -a rule_args=()
+  local arg parsed local_port proto_input remote_ip remote_port
+
+  for arg in "$@"; do
+    if [[ "$arg" == "-y" ]]; then
+      skip_confirm=1
+    else
+      rule_args+=("$arg")
+    fi
+  done
+
+  if [[ "${#rule_args[@]}" -lt 2 ]]; then
+    echo "Usage: $0 add PORT [PROTO] IP[:RPORT] [-y]"
+    return 1
+  fi
+
+  if ! ensure_ss_available; then
+    return 1
+  fi
+
+  if ! require_relay_lan_ip_cli; then
+    return 1
+  fi
+  ensure_tcp_mss
+
+  if ! parsed="$(parse_quick_input "${rule_args[*]}")"; then
+    echo "Invalid arguments. Example: $0 add 10086 172.81.1.1:33333"
+    return 1
+  fi
+  read -r local_port proto_input remote_ip remote_port <<< "$parsed"
+
+  add_rule_impl "$local_port" "$proto_input" "$remote_ip" "$remote_port" "$skip_confirm"
+}
+
+cli_delete_rule() {
+  local skip_confirm=0
+  local id=""
+  local arg
+
+  for arg in "$@"; do
+    if [[ "$arg" == "-y" ]]; then
+      skip_confirm=1
+    else
+      id="$arg"
+    fi
+  done
+
+  if [[ -z "$id" ]] || ! [[ "$id" =~ ^[0-9]+$ ]]; then
+    echo "Usage: $0 del NUMBER [-y]"
+    return 1
+  fi
+
+  if ! require_relay_lan_ip_cli; then
+    return 1
+  fi
+
+  if [[ "${#RECORDS[@]}" -eq 0 ]]; then
+    echo "No rules to delete."
+    return 1
+  fi
+
+  delete_rule_impl "$id" "$skip_confirm"
+}
+
+cli_set_ip() {
+  local ip="$1"
+  if [[ -z "$ip" ]]; then
+    echo "Usage: $0 set-ip IP"
+    return 1
+  fi
+  if ! valid_ipv4 "$ip"; then
+    echo "Invalid IPv4 address."
+    return 1
+  fi
+  RELAY_LAN_IP="$ip"
+  echo "RELAY_LAN_IP set to $RELAY_LAN_IP"
+  ensure_tcp_mss
+  apply_rules
+}
+
+cli_set_mss() {
+  local mss="$1"
+  if [[ -z "$mss" ]]; then
+    echo "Usage: $0 set-mss MSS (0=disable, 536-9000)"
+    return 1
+  fi
+  if ! valid_mss "$mss"; then
+    echo "Invalid MSS. Use 0 or 536-9000."
+    return 1
+  fi
+  if ! require_relay_lan_ip_cli; then
+    return 1
+  fi
+  TCP_MSS="$mss"
+  echo "TCP MSS set to $TCP_MSS"
+  apply_rules
+}
+
+# --- Menu ---
+
 show_menu() {
   echo
   echo "==== nft-po0.sh (fixed SNAT source IP) ===="
@@ -627,17 +880,13 @@ show_menu() {
 4) List forwarding rules
 5) Delete forwarding rule
 6) Apply/reload rules
-7) Enable nftables on boot (systemctl enable --now nftables)
+7) Enable nftables on boot
 8) Install nftables
 0) Exit
 EOF
 }
 
-main() {
-  require_root
-  load_state
-  prompt_relay_lan_ip_on_start
-
+interactive_main() {
   while true; do
     show_menu
     read -r -p "Select: " choice
@@ -654,6 +903,63 @@ main() {
       *) echo "Invalid selection." ;;
     esac
   done
+}
+
+main() {
+  require_root
+
+  case "${1:-}" in
+    list)
+      load_state
+      list_rules
+      ;;
+    add)
+      shift
+      load_state
+      cli_add_rule "$@"
+      ;;
+    del|delete)
+      shift
+      load_state
+      cli_delete_rule "$@"
+      ;;
+    apply)
+      load_state
+      if ! require_relay_lan_ip_cli; then
+        exit 1
+      fi
+      ensure_ipv4_forwarding || true
+      apply_rules
+      ;;
+    set-ip)
+      load_state
+      cli_set_ip "${2:-}"
+      ;;
+    set-mss)
+      load_state
+      cli_set_mss "${2:-}"
+      ;;
+    help|--help|-h)
+      show_usage
+      ;;
+    "")
+      load_state
+      if valid_ipv4 "$RELAY_LAN_IP"; then
+        echo "Loaded RELAY_LAN_IP: $RELAY_LAN_IP, TCP MSS: $TCP_MSS"
+      else
+        echo "RELAY_LAN_IP not set."
+        if ! ensure_relay_lan_ip; then
+          exit 1
+        fi
+      fi
+      interactive_main
+      ;;
+    *)
+      echo "Unknown command: $1"
+      show_usage
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"
