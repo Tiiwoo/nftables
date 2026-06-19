@@ -7,6 +7,13 @@ SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/99-nft-generic-forward.conf}"
 MANAGED_BEGIN="# === nft.sh managed records begin ==="
 MANAGED_END="# === nft.sh managed records end ==="
 NAT_TABLE="nft_mgr_nat"
+DOCKER_FILTER_TABLE="filter"
+DOCKER_USER_CHAIN="DOCKER-USER"
+FORWARD_CHAIN="nft_mgr_forward"
+FORWARD_JUMP_COMMENT="nft.sh managed forward jump"
+FORWARD_RULE_COMMENT="nft.sh managed forward"
+FORWARD_ESTABLISHED_COMMENT="nft.sh managed established"
+SOURCE_ANY="any"
 
 NFTMGR_TEST_MODE="${NFTMGR_TEST_MODE:-0}"
 NFTMGR_SKIP_ROOT_CHECK="${NFTMGR_SKIP_ROOT_CHECK:-0}"
@@ -79,9 +86,35 @@ valid_ipv4() {
   done
 }
 
+normalize_source() {
+  local source="${1:-$SOURCE_ANY}"
+  local source_lower
+
+  source_lower="$(to_lower "$source")"
+  case "$source_lower" in
+    ""|"-"|"*"|"any")
+      echo "$SOURCE_ANY"
+      ;;
+    *)
+      echo "$source"
+      ;;
+  esac
+}
+
+valid_rule_source() {
+  local source="$1"
+
+  [[ "$source" == "$SOURCE_ANY" ]] || valid_ipv4 "$source"
+}
+
 format_rule() {
-  local proto="$1" local_port="$2" remote_ip="$3" remote_port="$4"
-  printf "%s/%s -> %s:%s" "$local_port" "$proto" "$remote_ip" "$remote_port"
+  local proto="$1" local_port="$2" remote_ip="$3" remote_port="$4" source_ip="${5:-$SOURCE_ANY}"
+
+  if [[ "$source_ip" == "$SOURCE_ANY" ]]; then
+    printf "%s/%s -> %s:%s" "$local_port" "$proto" "$remote_ip" "$remote_port"
+  else
+    printf "%s/%s -> %s:%s (src %s)" "$local_port" "$proto" "$remote_ip" "$remote_port" "$source_ip"
+  fi
 }
 
 read_protocols() {
@@ -99,9 +132,10 @@ read_protocols() {
 parse_quick_input() {
   local input="$1"
   local -a parts
-  local local_port proto_str remote_part remote_ip remote_port
+  local local_port proto_str remote_part remote_ip remote_port source_ip
 
   IFS=' ' read -r -a parts <<< "$input"
+  source_ip="$SOURCE_ANY"
 
   case "${#parts[@]}" in
     2)
@@ -110,9 +144,22 @@ parse_quick_input() {
       remote_part="${parts[1]}"
       ;;
     3)
+      if read_protocols "${parts[1]}" >/dev/null 2>&1; then
+        local_port="${parts[0]}"
+        proto_str="${parts[1]}"
+        remote_part="${parts[2]}"
+      else
+        local_port="${parts[0]}"
+        proto_str="both"
+        remote_part="${parts[1]}"
+        source_ip="${parts[2]}"
+      fi
+      ;;
+    4)
       local_port="${parts[0]}"
       proto_str="${parts[1]}"
       remote_part="${parts[2]}"
+      source_ip="${parts[3]}"
       ;;
     *)
       return 1
@@ -131,25 +178,29 @@ parse_quick_input() {
   read_protocols "$proto_str" >/dev/null 2>&1 || return 1
   valid_ipv4 "$remote_ip" || return 1
   valid_port "$remote_port" || return 1
+  source_ip="$(normalize_source "$source_ip")"
+  valid_rule_source "$source_ip" || return 1
 
-  echo "$local_port $proto_str $remote_ip $remote_port"
+  echo "$local_port $proto_str $remote_ip $remote_port $source_ip"
 }
 
 # --- Parse / Load ---
 
 parse_rule_line() {
   local line="$1"
-  local hash tag proto local_port remote_ip remote_port extra
+  local hash tag proto local_port remote_ip remote_port source_ip extra
 
-  read -r hash tag proto local_port remote_ip remote_port extra <<< "$line"
+  read -r hash tag proto local_port remote_ip remote_port source_ip extra <<< "$line"
   [[ "${hash:-}" == "#" && "${tag:-}" == "RULE" ]] || return 1
   [[ -z "${extra:-}" ]] || return 1
   [[ "$proto" == "tcp" || "$proto" == "udp" ]] || return 1
   valid_port "$local_port" || return 1
   valid_ipv4 "$remote_ip" || return 1
   valid_port "$remote_port" || return 1
+  source_ip="$(normalize_source "$source_ip")"
+  valid_rule_source "$source_ip" || return 1
 
-  echo "$proto $local_port $remote_ip $remote_port"
+  echo "$proto $local_port $remote_ip $remote_port $source_ip"
 }
 
 load_records() {
@@ -236,10 +287,57 @@ table_exists() {
   nft list table ip "$table" >/dev/null 2>&1
 }
 
+chain_exists() {
+  local table="$1" chain="$2"
+  nft list chain ip "$table" "$chain" >/dev/null 2>&1
+}
+
 delete_table_if_exists() {
   local table="$1"
   if table_exists "$table"; then
     nft delete table ip "$table"
+  fi
+}
+
+list_rule_handles_by_comment() {
+  local table="$1" chain="$2" comment="$3"
+  local line marker
+
+  marker="comment \"$comment\""
+  nft -a list chain ip "$table" "$chain" 2>/dev/null | while IFS= read -r line; do
+    [[ "$line" == *"$marker"* ]] || continue
+    if [[ "$line" =~ (^|[[:space:]])handle[[:space:]]+([0-9]+) ]]; then
+      echo "${BASH_REMATCH[2]}"
+    fi
+  done
+}
+
+delete_rules_by_comment() {
+  local table="$1" chain="$2" comment="$3"
+  local handle
+
+  while IFS= read -r handle; do
+    [[ -n "$handle" ]] || continue
+    nft delete rule ip "$table" "$chain" handle "$handle" || return 1
+  done < <(list_rule_handles_by_comment "$table" "$chain" "$comment")
+}
+
+delete_forward_jump_rules() {
+  delete_rules_by_comment "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" "$FORWARD_JUMP_COMMENT"
+}
+
+ensure_forward_chain() {
+  if chain_exists "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN"; then
+    nft flush chain ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN"
+  else
+    nft add chain ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN"
+  fi
+}
+
+delete_forward_chain_if_exists() {
+  if chain_exists "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN"; then
+    nft flush chain ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN" || return 1
+    nft delete chain ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN" || return 1
   fi
 }
 
@@ -265,10 +363,10 @@ syntax_check_rules_file() {
 rule_exists() {
   local proto="$1"
   local local_port="$2"
-  local rec p l ip r
+  local rec p l ip r source_ip
 
   for rec in "${RECORDS[@]}"; do
-    read -r p l ip r <<< "$rec"
+    read -r p l ip r source_ip <<< "$rec"
     if [[ "$p" == "$proto" && "$l" == "$local_port" ]]; then
       return 0
     fi
@@ -297,17 +395,61 @@ port_in_use() {
   esac
 }
 
+apply_docker_forward_rules() {
+  local rec proto local_port remote_ip remote_port source_ip
+  local key
+  local -A emitted_rules=()
+  local -a rule_args=()
+
+  if ! chain_exists "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN"; then
+    return 0
+  fi
+
+  delete_forward_jump_rules || return 1
+
+  if [[ "${#RECORDS[@]}" -eq 0 ]]; then
+    delete_forward_chain_if_exists
+    return $?
+  fi
+
+  ensure_forward_chain || return 1
+
+  nft add rule ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN" \
+    ct state established,related accept comment "$FORWARD_ESTABLISHED_COMMENT" || return 1
+
+  for rec in "${RECORDS[@]}"; do
+    read -r proto local_port remote_ip remote_port source_ip <<< "$rec"
+    source_ip="$(normalize_source "$source_ip")"
+    key="${source_ip}|${remote_ip}|${remote_port}|${proto}"
+    [[ -n "${emitted_rules[$key]:-}" ]] && continue
+    emitted_rules[$key]=1
+
+    rule_args=(nft add rule ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN")
+
+    if [[ "$source_ip" != "$SOURCE_ANY" ]]; then
+      rule_args+=(ip saddr "$source_ip")
+    fi
+
+    rule_args+=(ip daddr "$remote_ip" "$proto" dport "$remote_port" accept)
+    rule_args+=(comment "$FORWARD_RULE_COMMENT")
+    "${rule_args[@]}" || return 1
+  done
+
+  nft insert rule ip "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" \
+    jump "$FORWARD_CHAIN" comment "$FORWARD_JUMP_COMMENT"
+}
+
 # --- Render / Apply ---
 
 render_config() {
   local output_file="${1:-$NFT_CONF}"
-  local rec proto local_port remote_ip remote_port
+  local rec proto local_port remote_ip remote_port source_ip
   local key protos
   local -A grouped_protos=()
   local -a grouped_order=()
 
   for rec in "${RECORDS[@]}"; do
-    read -r proto local_port remote_ip remote_port <<< "$rec"
+    read -r proto local_port remote_ip remote_port source_ip <<< "$rec"
     key="${local_port}|${remote_ip}|${remote_port}"
     if [[ -z "${grouped_protos[$key]:-}" ]]; then
       grouped_protos[$key]="$proto"
@@ -398,6 +540,12 @@ apply_rules() {
     return 1
   fi
 
+  if ! apply_docker_forward_rules; then
+    rm -f "$tmp_file"
+    echo "Failed to apply Docker DOCKER-USER forward rules."
+    return 1
+  fi
+
   if ! install -m 644 "$tmp_file" "$NFT_CONF"; then
     rm -f "$tmp_file"
     echo "Rules are active, but failed to persist config to $NFT_CONF"
@@ -412,7 +560,7 @@ apply_rules() {
 
 list_rules() {
   local i=0
-  local rec proto local_port remote_ip remote_port
+  local rec proto local_port remote_ip remote_port source_ip
 
   load_records
   if [[ "${#RECORDS[@]}" -eq 0 ]]; then
@@ -422,17 +570,24 @@ list_rules() {
 
   echo "Current forwarding rules:"
   for rec in "${RECORDS[@]}"; do
-    read -r proto local_port remote_ip remote_port <<< "$rec"
+    read -r proto local_port remote_ip remote_port source_ip <<< "$rec"
     i=$((i + 1))
-    printf "%d) %s\n" "$i" "$(format_rule "$proto" "$local_port" "$remote_ip" "$remote_port")"
+    printf "%d) %s\n" "$i" "$(format_rule "$proto" "$local_port" "$remote_ip" "$remote_port" "$source_ip")"
   done
 }
 
 add_rule_impl() {
   local local_port="$1" proto_input="$2" remote_ip="$3" remote_port="$4"
-  local skip_confirm="${5:-0}"
+  local source_ip="${5:-$SOURCE_ANY}"
+  local skip_confirm="${6:-0}"
   local proto_values p
   local -a protocols
+
+  source_ip="$(normalize_source "$source_ip")"
+  if ! valid_rule_source "$source_ip"; then
+    echo "Invalid source IPv4 address."
+    return 1
+  fi
 
   if ! proto_values="$(read_protocols "$proto_input")"; then
     echo "Invalid protocol selection."
@@ -451,7 +606,11 @@ add_rule_impl() {
     fi
   done
 
-  echo "Add rule: $local_port/$proto_input -> $remote_ip:$remote_port"
+  if [[ "$source_ip" == "$SOURCE_ANY" ]]; then
+    echo "Add rule: $local_port/$proto_input -> $remote_ip:$remote_port"
+  else
+    echo "Add rule: $local_port/$proto_input -> $remote_ip:$remote_port (src $source_ip)"
+  fi
   if ((skip_confirm == 0)); then
     if ! confirm_default_yes "Confirm? [Y/n]: "; then
       echo "Cancelled."
@@ -460,7 +619,7 @@ add_rule_impl() {
   fi
 
   for p in "${protocols[@]}"; do
-    RECORDS+=("$p $local_port $remote_ip $remote_port")
+    RECORDS+=("$p $local_port $remote_ip $remote_port $source_ip")
   done
 
   ensure_ipv4_forwarding || true
@@ -468,7 +627,7 @@ add_rule_impl() {
 }
 
 add_rule() {
-  local local_port remote_ip remote_port proto_input quick_input parsed
+  local local_port remote_ip remote_port proto_input source_ip quick_input parsed
 
   if ! ensure_ss_available; then
     return 1
@@ -476,15 +635,15 @@ add_rule() {
 
   load_records
 
-  echo "Quick add format: PORT [PROTO] IP[:RPORT] (e.g. 10086 172.81.1.1:33333)"
+  echo "Quick add format: PORT [PROTO] IP[:RPORT] [SOURCE_IP] (e.g. 10086 172.81.1.1:33333 10.100.128.184)"
   read -r -p "Quick add (or Enter for step-by-step): " quick_input
 
   if [[ -n "$quick_input" ]]; then
     if ! parsed="$(parse_quick_input "$quick_input")"; then
-      echo "Invalid format. Example: 10086 172.81.1.1:33333"
+      echo "Invalid format. Example: 10086 172.81.1.1:33333 [SOURCE_IP]"
       return 1
     fi
-    read -r local_port proto_input remote_ip remote_port <<< "$parsed"
+    read -r local_port proto_input remote_ip remote_port source_ip <<< "$parsed"
   else
     read -r -p "Local port: " local_port
     if ! valid_port "$local_port"; then
@@ -507,9 +666,16 @@ add_rule() {
       echo "Invalid remote port."
       return 1
     fi
+
+    read -r -p "Allowed source IPv4 (default: any): " source_ip
+    source_ip="$(normalize_source "$source_ip")"
+    if ! valid_rule_source "$source_ip"; then
+      echo "Invalid source IPv4 address."
+      return 1
+    fi
   fi
 
-  add_rule_impl "$local_port" "$proto_input" "$remote_ip" "$remote_port"
+  add_rule_impl "$local_port" "$proto_input" "$remote_ip" "$remote_port" "$source_ip"
 }
 
 delete_rule_impl() {
@@ -517,7 +683,7 @@ delete_rule_impl() {
   local skip_confirm="${2:-0}"
   local i
   local -a next_records=()
-  local del_rec del_proto del_lport del_rip del_rport
+  local del_rec del_proto del_lport del_rip del_rport del_source
 
   if ! [[ "$id" =~ ^[0-9]+$ ]]; then
     echo "Invalid selection."
@@ -529,8 +695,8 @@ delete_rule_impl() {
   fi
 
   del_rec="${RECORDS[$((id - 1))]}"
-  read -r del_proto del_lport del_rip del_rport <<< "$del_rec"
-  echo "Delete rule: $(format_rule "$del_proto" "$del_lport" "$del_rip" "$del_rport")"
+  read -r del_proto del_lport del_rip del_rport del_source <<< "$del_rec"
+  echo "Delete rule: $(format_rule "$del_proto" "$del_lport" "$del_rip" "$del_rport" "$del_source")"
 
   if ((skip_confirm == 0)); then
     if ! confirm "Confirm delete? [y/N]: "; then
@@ -584,7 +750,8 @@ show_usage() {
 Usage:
   $0                              Interactive menu
   $0 list                         List current rules
-  $0 add PORT [PROTO] IP[:RPORT]  Add a forwarding rule
+  $0 add PORT [PROTO] IP[:RPORT] [SOURCE_IP]
+                                  Add a forwarding rule
   $0 del NUMBER [-y]              Delete a rule by number
   $0 apply                        Re-apply rules from config
   $0 help                         Show this help
@@ -593,6 +760,8 @@ Examples:
   $0 add 10086 172.81.1.1:33333       # both tcp+udp
   $0 add 10086 tcp 172.81.1.1:33333   # tcp only
   $0 add 10086 172.81.1.1             # remote port = local port
+  $0 add 29595 194.104.146.6:19595 10.100.128.184
+                                           # only allow this source
   $0 del 1 -y                         # delete rule #1, skip confirmation
 EOF
 }
@@ -600,7 +769,7 @@ EOF
 cli_add_rule() {
   local skip_confirm=0
   local -a rule_args=()
-  local arg parsed local_port proto_input remote_ip remote_port
+  local arg parsed local_port proto_input remote_ip remote_port source_ip
 
   for arg in "$@"; do
     if [[ "$arg" == "-y" ]]; then
@@ -611,7 +780,7 @@ cli_add_rule() {
   done
 
   if [[ "${#rule_args[@]}" -lt 2 ]]; then
-    echo "Usage: $0 add PORT [PROTO] IP[:RPORT] [-y]"
+    echo "Usage: $0 add PORT [PROTO] IP[:RPORT] [SOURCE_IP] [-y]"
     return 1
   fi
 
@@ -622,12 +791,12 @@ cli_add_rule() {
   load_records
 
   if ! parsed="$(parse_quick_input "${rule_args[*]}")"; then
-    echo "Invalid arguments. Example: $0 add 10086 172.81.1.1:33333"
+    echo "Invalid arguments. Example: $0 add 10086 172.81.1.1:33333 10.100.128.184"
     return 1
   fi
-  read -r local_port proto_input remote_ip remote_port <<< "$parsed"
+  read -r local_port proto_input remote_ip remote_port source_ip <<< "$parsed"
 
-  add_rule_impl "$local_port" "$proto_input" "$remote_ip" "$remote_port" "$skip_confirm"
+  add_rule_impl "$local_port" "$proto_input" "$remote_ip" "$remote_port" "$source_ip" "$skip_confirm"
 }
 
 cli_delete_rule() {
