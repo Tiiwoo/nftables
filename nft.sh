@@ -107,6 +107,13 @@ valid_rule_source() {
   [[ "$source" == "$SOURCE_ANY" ]] || valid_ipv4 "$source"
 }
 
+nft_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
 format_rule() {
   local proto="$1" local_port="$2" remote_ip="$3" remote_port="$4" source_ip="${5:-$SOURCE_ANY}"
 
@@ -415,7 +422,7 @@ apply_docker_forward_rules() {
   ensure_forward_chain || return 1
 
   nft add rule ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN" \
-    ct state established,related accept comment "$FORWARD_ESTABLISHED_COMMENT" || return 1
+    ct state established,related accept comment "$(nft_string "$FORWARD_ESTABLISHED_COMMENT")" || return 1
 
   for rec in "${RECORDS[@]}"; do
     read -r proto local_port remote_ip remote_port source_ip <<< "$rec"
@@ -431,12 +438,12 @@ apply_docker_forward_rules() {
     fi
 
     rule_args+=(ip daddr "$remote_ip" "$proto" dport "$remote_port" accept)
-    rule_args+=(comment "$FORWARD_RULE_COMMENT")
+    rule_args+=(comment "$(nft_string "$FORWARD_RULE_COMMENT")")
     "${rule_args[@]}" || return 1
   done
 
   nft insert rule ip "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" \
-    jump "$FORWARD_CHAIN" comment "$FORWARD_JUMP_COMMENT"
+    jump "$FORWARD_CHAIN" comment "$(nft_string "$FORWARD_JUMP_COMMENT")"
 }
 
 # --- Render / Apply ---
