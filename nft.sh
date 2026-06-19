@@ -10,9 +10,10 @@ NAT_TABLE="nft_mgr_nat"
 DOCKER_FILTER_TABLE="filter"
 DOCKER_USER_CHAIN="DOCKER-USER"
 FORWARD_CHAIN="nft_mgr_forward"
-FORWARD_JUMP_COMMENT="nft.sh managed forward jump"
-FORWARD_RULE_COMMENT="nft.sh managed forward"
-FORWARD_ESTABLISHED_COMMENT="nft.sh managed established"
+FORWARD_JUMP_COMMENT="nft_sh_managed_forward_jump"
+FORWARD_RULE_COMMENT="nft_sh_managed_forward"
+FORWARD_ESTABLISHED_COMMENT="nft_sh_managed_established"
+LEGACY_FORWARD_JUMP_COMMENT="nft.sh managed forward jump"
 SOURCE_ANY="any"
 
 NFTMGR_TEST_MODE="${NFTMGR_TEST_MODE:-0}"
@@ -105,13 +106,6 @@ valid_rule_source() {
   local source="$1"
 
   [[ "$source" == "$SOURCE_ANY" ]] || valid_ipv4 "$source"
-}
-
-nft_string() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  printf '"%s"' "$value"
 }
 
 format_rule() {
@@ -330,7 +324,8 @@ delete_rules_by_comment() {
 }
 
 delete_forward_jump_rules() {
-  delete_rules_by_comment "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" "$FORWARD_JUMP_COMMENT"
+  delete_rules_by_comment "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" "$FORWARD_JUMP_COMMENT" || return 1
+  delete_rules_by_comment "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" "$LEGACY_FORWARD_JUMP_COMMENT"
 }
 
 ensure_forward_chain() {
@@ -422,7 +417,7 @@ apply_docker_forward_rules() {
   ensure_forward_chain || return 1
 
   nft add rule ip "$DOCKER_FILTER_TABLE" "$FORWARD_CHAIN" \
-    ct state established,related accept comment "$(nft_string "$FORWARD_ESTABLISHED_COMMENT")" || return 1
+    ct state established,related accept comment "$FORWARD_ESTABLISHED_COMMENT" || return 1
 
   for rec in "${RECORDS[@]}"; do
     read -r proto local_port remote_ip remote_port source_ip <<< "$rec"
@@ -438,12 +433,12 @@ apply_docker_forward_rules() {
     fi
 
     rule_args+=(ip daddr "$remote_ip" "$proto" dport "$remote_port" accept)
-    rule_args+=(comment "$(nft_string "$FORWARD_RULE_COMMENT")")
+    rule_args+=(comment "$FORWARD_RULE_COMMENT")
     "${rule_args[@]}" || return 1
   done
 
   nft insert rule ip "$DOCKER_FILTER_TABLE" "$DOCKER_USER_CHAIN" \
-    jump "$FORWARD_CHAIN" comment "$(nft_string "$FORWARD_JUMP_COMMENT")"
+    jump "$FORWARD_CHAIN" comment "$FORWARD_JUMP_COMMENT"
 }
 
 # --- Render / Apply ---
